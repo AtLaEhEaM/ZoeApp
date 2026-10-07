@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#121218">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<title>PadLink</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #121218; color: #bbb;
+    font-family: system-ui, sans-serif; overflow: hidden; overscroll-behavior: none;
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  #pad { position: fixed; inset: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  .btn, #stick { position: absolute; touch-action: none; }
+  .btn { border: 0; border-radius: 18px; color: #fff; font-size: clamp(18px, 5vmin, 40px);
+    font-weight: 600; display: flex; align-items: center; justify-content: center;
+    opacity: .92; transition: transform .04s, filter .04s; }
+  .btn.down { transform: scale(.93); filter: brightness(1.6); }
+  .dpad { background: #34405a; } .act { background: #5a3440; } .mouse { background: #345a40; font-size: clamp(14px, 3.6vmin, 28px); }
+  #stick { border-radius: 50%; background: rgba(52,64,90,.55); border: 2px solid rgba(130,155,205,.9); }
+  #knob { position: absolute; border-radius: 50%; background: #5a3440; width: 38%; height: 38%;
+    left: 31%; top: 31%; pointer-events: none; }
+  #bar { position: absolute; top: 0; left: 0; right: 0; height: 6%; display: flex;
+    align-items: center; justify-content: space-between; padding: 0 12px; font-size: 13px;
+    pointer-events: none; }
+  #bar button { pointer-events: auto; background: none; border: 0; color: #bbb; font-size: 18px; padding: 6px 10px; }
+  #lock { position: fixed; inset: 0; background: rgba(10,10,14,.96); display: none;
+    align-items: center; justify-content: center; z-index: 10; touch-action: auto; user-select: auto; }
+  #lock.show { display: flex; }
+  #lock form { display: flex; flex-direction: column; gap: 12px; width: min(86vw, 360px); }
+  #lock input { padding: 14px; font-size: 18px; border-radius: 10px; border: 1px solid #456;
+    background: #1c1c26; color: #fff; }
+  #lock button { padding: 14px; font-size: 18px; border-radius: 10px; border: 0; background: #3a7a55; color: #fff; }
+  #lock h2 { margin: 0; color: #fff; }
+</style>
+</head>
+<body>
+<div id="pad">
+  <div id="bar"><span id="status">starting...</span>
+    <span><button id="fs" title="Fullscreen">&#x26F6;</button><button id="gear" title="Password">&#9881;</button></span></div>
+</div>
+
+<div id="lock"><form id="pwform">
+  <h2>PadLink password</h2>
+  <input id="pw" type="password" autocomplete="off" placeholder="Same as SECRET on your PC">
+  <button type="submit">Connect</button>
+</form></div>
+
+<script src="mqtt.min.js"></script>
+<script>
+"use strict";
+/* ---------- config (must match padlink_common.py on the PC) ---------- */
+const BROKER_URL = "wss://broker.hivemq.com:8884/mqtt";
+const BUTTON_KEYS = ["m", "n", "b", "v"];
+const DPAD = { up: "w", left: "a", down: "s", right: "d" };
+const HEARTBEAT_MS = 200;
+const LOOK_MIN_GAP_MS = 30;
+
+/* ---------- helpers ---------- */
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder();
+const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+const rid = () => hex(crypto.getRandomValues(new Uint8Array(6)));
+
+async function sha256hex(s) { return hex(await crypto.subtle.digest("SHA-256", enc.encode(s))); }
+async function hmacKey(secret) {
+  return crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+
+/* ---------- state ---------- */
+let secret = localStorage.getItem("padlink_secret") || "";
+let key = null, topic = "", client = null, online = false;
+const sid = rid();
+let seq = 0;
+const held = {};            // keyName -> Set(pointerId)
+let look = [0, 0];
+let sending = false, dirty = false, lastSend = 0, timer = null;
+
+/* ---------- UI build ---------- */
+const pad = $("pad");
+function addBtn(label, cls, keyName, x, y, w, h) {
+  const b = document.createElement("div");
+  b.className = "btn " + cls; b.textContent = label;
+  Object.assign(b.style, { left: x + "%", top: (100 - y - h) + "%", width: w + "%", height: h + "%" });
+  b.addEventListener("pointerdown", e => {
+    e.preventDefault(); b.setPointerCapture(e.pointerId);
+    (held[keyName] ||= new Set()).add(e.pointerId); b.classList.add("down");
+    requestSend(true); wake();
+  });
+  const up = e => {
+    held[keyName]?.delete(e.pointerId);
+    if (!held[keyName] || held[keyName].size === 0) b.classList.remove("down");
+    requestSend(true);
+  };
+  b.addEventListener("pointerup", up); b.addEventListener("pointercancel", up);
+  pad.appendChild(b);
+}
+// D-pad (left)  - positions mirror the Android app (% of screen, y from bottom)
+addBtn("\u25B2", "dpad", DPAD.up,    12, 52, 10, 22);
+addBtn("\u25C0", "dpad", DPAD.left,   1, 30, 10, 22);
+addBtn("\u25B6", "dpad", DPAD.right, 23, 30, 10, 22);
+addBtn("\u25BC", "dpad", DPAD.down,  12,  8, 10, 22);
+// M N B V diamond (centre)
+addBtn("M", "act", "m", 46, 52, 9, 22);
+addBtn("N", "act", "n", 37, 30, 9, 22);
+addBtn("V", "act", "v", 55, 30, 9, 22);
+addBtn("B", "act", "b", 46,  8, 9, 22);
+// Mouse buttons
+addBtn("L-Click", "mouse", "lmb", 69, 64, 14, 22);
+addBtn("R-Click", "mouse", "rmb", 84, 64, 14, 22);
+
+// Look joystick (bottom right)
+const stick = document.createElement("div");
+stick.id = "stick";
+Object.assign(stick.style, { left: "68%", top: "44%", width: "30%", height: "52%" });
+const knob = document.createElement("div"); knob.id = "knob"; stick.appendChild(knob);
+pad.appendChild(stick);
+let stickPtr = null;
+function stickMove(e) {
+  const r = stick.getBoundingClientRect();
+  const R = Math.min(r.width, r.height) / 2;
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const lim = R * (1 - 0.38);                       // knob travel (knob is 38% of the stick)
+  let dx = e.clientX - cx, dy = e.clientY - cy;
+  const dist = Math.hypot(dx, dy);
+  const m = Math.min(dist, lim);
+  const nx = dist ? (dx / dist) * m / lim : 0, ny = dist ? (dy / dist) * m / lim : 0;
+  knob.style.transform = `translate(${nx * lim}px, ${ny * lim}px)`;
+  look = [Math.round(nx * 100), Math.round(-ny * 100)];   // y up = positive
+  requestSend(false);
+}
+function stickEnd(e) {
+  if (e.pointerId !== stickPtr) return;
+  stickPtr = null; look = [0, 0]; knob.style.transform = "";
+  requestSend(true);
+}
+stick.addEventListener("pointerdown", e => {
+  e.preventDefault(); if (stickPtr !== null) return;
+  stickPtr = e.pointerId; stick.setPointerCapture(e.pointerId); stickMove(e); wake();
+});
+stick.addEventListener("pointermove", e => { if (e.pointerId === stickPtr) stickMove(e); });
+stick.addEventListener("pointerup", stickEnd);
+stick.addEventListener("pointercancel", stickEnd);
+
+/* ---------- sending ---------- */
+function currentKeys() { return Object.keys(held).filter(k => held[k].size > 0).sort(); }
+
+function requestSend(force) {
+  if (!online || !key) return;
+  const wait = LOOK_MIN_GAP_MS - (performance.now() - lastSend);
+  if (force || wait <= 0) { dirty = true; pump(); }
+  else if (!timer) timer = setTimeout(() => { timer = null; dirty = true; pump(); }, wait);
+}
+async function pump() {
+  if (sending) return;
+  sending = true;
+  try {
+    while (dirty) {
+      dirty = false;
+      const keys = currentKeys(), lk = [...look], ts = Math.floor(Date.now() / 1000), n = ++seq;
+      const msg = `${sid}|${n}|${ts}|${keys.join(",")}|${lk[0]},${lk[1]}`;
+      const sig = hex(await crypto.subtle.sign("HMAC", key, enc.encode(msg)));
+      if (client && online)
+        client.publish(topic, JSON.stringify({ sid, seq: n, ts, keys, look: lk, sig }), { qos: 0 });
+      lastSend = performance.now();
+    }
+  } finally { sending = false; }
+}
+setInterval(() => { dirty = true; pump(); }, HEARTBEAT_MS);
+
+function releaseAll() {
+  for (const k in held) held[k].clear();
+  document.querySelectorAll(".btn.down").forEach(b => b.classList.remove("down"));
+  look = [0, 0]; knob.style.transform = ""; stickPtr = null;
+  requestSend(true);
+}
+document.addEventListener("visibilitychange", () => { if (document.hidden) releaseAll(); else wake(); });
+window.addEventListener("blur", releaseAll);
+
+/* ---------- connection ---------- */
+function setStatus(t) { $("status").textContent = t; }
+
+async function start() {
+  if (client) { client.end(true); client = null; }
+  online = false;
+  key = await hmacKey(secret);
+  topic = "padlink/" + (await sha256hex(secret)).slice(0, 24);
+  setStatus("connecting...");
+  client = mqtt.connect(BROKER_URL, { clientId: "padlink-web-" + rid(), reconnectPeriod: 2000,
+                                      keepalive: 30, clean: true });
+  client.on("connect", () => { online = true; setStatus("connected " + topic.slice(-8)); requestSend(true); });
+  client.on("reconnect", () => setStatus("reconnecting..."));
+  client.on("offline", () => { online = false; setStatus("offline"); });
+  client.on("close", () => { online = false; });
+  client.on("error", e => setStatus("error: " + (e.message || e).toString().slice(0, 50)));
+}
+
+/* ---------- password prompt ---------- */
+function askPassword() { $("pw").value = ""; $("lock").classList.add("show"); $("pw").focus(); }
+$("pwform").addEventListener("submit", e => {
+  e.preventDefault();
+  const v = $("pw").value;
+  if (!v) return;
+  secret = v; localStorage.setItem("padlink_secret", v);
+  $("lock").classList.remove("show"); start();
+});
+$("gear").addEventListener("click", askPassword);
+$("fs").addEventListener("click", () => {
+  const el = document.documentElement;
+  (el.requestFullscreen ? el.requestFullscreen() : Promise.reject())
+    .then(() => screen.orientation?.lock?.("landscape").catch(() => {})).catch(() => {});
+});
+
+/* ---------- misc ---------- */
+let wl = null;
+async function wake() { try { if (!wl || wl.released) wl = await navigator.wakeLock?.request("screen"); } catch (e) {} }
+document.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("gesturestart", e => e.preventDefault());
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+
+if (secret) start(); else askPassword();
+</script>
+</body>
+</html>
